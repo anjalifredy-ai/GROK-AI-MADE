@@ -69,17 +69,6 @@ private val ExpressiveShapes = Shapes(
     extraLarge = RoundedCornerShape(36.dp)
 )
 
-/**
- * How Koda turns its three theme preferences into a [ColorScheme]. Extracted
- * from [IvorMusicTheme] because the home screen widgets need the same answer
- * outside a Compose UI composition - a Glance composition has no
- * LocalContext of the Compose kind and cannot call [IvorMusicTheme] at all, and
- * widgets drawn in raw system dynamic color while the app runs a chosen palette
- * look like a different app's widgets.
- *
- * Takes a plain [android.content.Context] rather than reading a composition
- * local so both callers can use it.
- */
 fun kodaColorScheme(
     context: android.content.Context,
     darkTheme: Boolean,
@@ -87,9 +76,6 @@ fun kodaColorScheme(
     amoledDark: Boolean,
 ): ColorScheme {
     val useDynamic = colorPalette == DYNAMIC_PALETTE_ID
-    // Neutral base scheme (surfaces, on-surface text). Dynamic pulls from the
-    // wallpaper; a fixed palette starts from the app's own neutral scheme so
-    // wallpaper color is fully ignored and only our accents apply.
     val baseColorScheme = when {
         useDynamic && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
             if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
@@ -109,7 +95,7 @@ fun kodaColorScheme(
 @Composable
 fun IvorMusicTheme(
     darkTheme: Boolean = true, // Default to dark theme for this music app
-    colorPalette: String = DYNAMIC_PALETTE_ID, // "dynamic" = wallpaper color, else a fixed AppPalette id
+    colorPalette: String = "youtube", // YouTube Red as default for this fork
     amoledDark: Boolean = false, // Pure black backgrounds when dark theme is active
     uiScale: Float = UI_SCALE_DEFAULT, // Multiplies every dp and sp in the app
     content: @Composable () -> Unit
@@ -127,18 +113,8 @@ fun IvorMusicTheme(
             val window = (view.context as Activity).window
             window.statusBarColor = Color.Transparent.toArgb()
             window.navigationBarColor = Color.Transparent.toArgb()
-            // enableEdgeToEdge leaves contrast enforcement on for the
-            // navigation bar, which paints a translucent system scrim behind
-            // it on three-button navigation - a visible band under the
-            // floating toolbar and the mini player. Both setters are no-ops
-            // from API 35, where the system owns this; they still matter on
-            // 30-34.
             window.isStatusBarContrastEnforced = false
             window.isNavigationBarContrastEnforced = false
-            // Deliberately kept even though enableEdgeToEdge normally handles
-            // icon appearance: it decides from the system uiMode, and Koda's
-            // theme mode is its own setting, so a user forcing dark inside the
-            // app on a light system would otherwise get dark icons on dark.
             WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
             WindowCompat.getInsetsController(window, view).isAppearanceLightNavigationBars = !darkTheme
         }
@@ -154,26 +130,6 @@ fun IvorMusicTheme(
     }
 }
 
-/**
- * Rescales the whole interface by lying about the display's density.
- *
- * Every `dp` in the app is converted to pixels through [LocalDensity], so
- * multiplying the density here resizes all 3,400-odd of them at once and keeps
- * the proportions the design was drawn at - which is the entire reason the
- * setting is a density override rather than a sweep of the dp literals.
- *
- * [Density.fontScale] is deliberately left alone rather than divided back out.
- * Compose resolves `sp` as `density * fontScale`, so text rides along with the
- * chrome and the layout stays in proportion; compensating would hold type at
- * its old size inside boxes that had shrunk around it. The user's system font
- * setting still applies on top, because it is the untouched multiplier.
- *
- * Applied inside `MaterialExpressiveTheme` so every consumer of the theme
- * sees it, dialogs and bottom sheets included - those compose as
- * subcompositions and inherit the local. Deliberately not reaching the Glance
- * widgets or the media notification: those are drawn by another process and
- * should match its density, not Koda's.
- */
 @Composable
 private fun ScaledDensity(scale: Float, content: @Composable () -> Unit) {
     if (scale == UI_SCALE_DEFAULT) {
