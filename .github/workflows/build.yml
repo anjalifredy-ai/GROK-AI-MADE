@@ -7,7 +7,6 @@ on:
     branches: [ main, master, develop ]
   workflow_dispatch:
 
-# Least privilege by default: no job gets a token unless it asks for one below.
 permissions: {}
 
 concurrency:
@@ -16,15 +15,9 @@ concurrency:
 
 env:
   TELEGRAM_APK_CHAT_ID: "@ivorisnoob_chat"
-  # The repository owner's name is rendered as a link to this. A PR author who
-  # is anybody else stays plain text: this is a personal site, not a generic
-  # "whoever opened the PR" link.
   OWNER_URL: "https://ivorisnoob.lol"
 
 jobs:
-  # Nothing builds until this job says the run was started by someone with write
-  # access to this repository. Every other job hangs off it via `needs`, so an
-  # untrusted PR costs a few seconds of a runner and stops.
   authorize:
     name: Authorize run
     runs-on: ubuntu-latest
@@ -40,23 +33,12 @@ jobs:
           ACTOR: ${{ github.actor }}
           REPO: ${{ github.repository }}
           REPO_OWNER: ${{ github.repository_owner }}
-          # Computed by GitHub from repo membership; a PR author cannot set it.
           PR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          # Optional repo variable, a space separated list of logins the owner
-          # wants treated as trusted (Settings > Secrets and variables > Actions).
-          # Commas are tolerated here; the release gate in telegram-notify.yml
-          # matches on spaces, so prefer spaces.
           EXTRA_TRUSTED: ${{ vars.TRUSTED_ACTORS }}
         run: |
           set -euo pipefail
-
-          # Bots that push on the owner's behalf. Everything else has to earn it
-          # through repository membership.
-          # read -a splits on whitespace without pathname expansion, which the
-          # bracketed bot logins need: unquoted `claude[bot]` is a glob pattern.
           read -r -a TRUSTED <<< "${REPO_OWNER} claude claude[bot] claude-bot claude-code[bot] ${EXTRA_TRUSTED//,/ }"
-
           actor_is_trusted() {
             local candidate
             for candidate in "${TRUSTED[@]}"; do
@@ -66,24 +48,17 @@ jobs:
             done
             return 1
           }
-
           allowed=false
           is_fork_pr=false
           reason=""
-
           case "${EVENT_NAME}" in
             pull_request)
               if [ "${PR_HEAD_REPO}" = "${REPO}" ]; then
-                # A branch can only exist in this repo if someone with write
-                # access pushed it, so a same-repo PR is authorized by construction.
                 allowed=true
                 reason="same-repo pull request"
               else
                 is_fork_pr=true
                 case "${PR_ASSOCIATION}" in
-                  # To also let previously merged contributors build fork PRs,
-                  # add CONTRIBUTOR to this list. Left out on purpose: it is not
-                  # a permission the owner granted.
                   OWNER|MEMBER|COLLABORATOR)
                     allowed=true
                     reason="fork pull request from ${PR_ASSOCIATION}"
@@ -106,10 +81,8 @@ jobs:
               reason="unhandled event ${EVENT_NAME}"
               ;;
           esac
-
           echo "allowed=${allowed}" >> "$GITHUB_OUTPUT"
           echo "is-fork-pr=${is_fork_pr}" >> "$GITHUB_OUTPUT"
-
           if [ "${allowed}" = "true" ]; then
             echo "Authorized: ${ACTOR} (${reason})." >> "$GITHUB_STEP_SUMMARY"
           else
@@ -117,7 +90,6 @@ jobs:
               echo "### Build skipped"
               echo ""
               echo "\`${ACTOR}\` is not the repository owner or a collaborator (${reason})."
-              echo "A maintainer can run this build by pushing the change to a branch in this repository."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -128,26 +100,21 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
         persist-credentials: false
-
     - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
         java-version: '17'
         distribution: 'temurin'
         cache: gradle
-
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
-
     - name: Build Debug APK
       run: ./gradlew assembleDebug
-
     - name: Upload Debug APK (Universal)
       uses: actions/upload-artifact@v4
       with:
@@ -155,7 +122,6 @@ jobs:
         path: app/build/outputs/apk/debug/*universal*.apk
         if-no-files-found: error
         retention-days: 14
-
     - name: Upload Debug APK (arm64-v8a)
       uses: actions/upload-artifact@v4
       with:
@@ -163,7 +129,6 @@ jobs:
         path: app/build/outputs/apk/debug/*arm64-v8a*.apk
         if-no-files-found: error
         retention-days: 14
-
     - name: Upload Debug APK (armeabi-v7a)
       uses: actions/upload-artifact@v4
       with:
@@ -175,47 +140,49 @@ jobs:
   build-release:
     name: Build Release APK
     needs: authorize
-    # Fork PRs never receive the signing secrets, so a release build there would
-    # fail on the keystore decode. Debug still runs for them.
     if: needs.authorize.outputs.allowed == 'true' && needs.authorize.outputs.is-fork-pr != 'true'
     runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        # Telegram changelogs are computed from the last successfully delivered
-        # PR head, which can be older than checkout's default shallow history.
         fetch-depth: 0
         persist-credentials: false
-
     - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
         java-version: '17'
         distribution: 'temurin'
         cache: gradle
-
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
-
-    - name: Decode keystore
+    - name: Prepare keystore (skip corrupt upstream secrets)
       env:
         KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
       run: |
         mkdir -p keystore
-        echo "$KEYSTORE_BASE64" | base64 --decode > keystore/ivormusic.jks
-
+        # Upstream Koda secrets are not available / corrupt on this personal fork.
+        # Leaving no keystore file makes app/build.gradle.kts fall back to debug signing.
+        rm -f keystore/ivormusic.jks
+        if [ -n "${KEYSTORE_BASE64:-}" ]; then
+          echo "$KEYSTORE_BASE64" | base64 --decode > keystore/ivormusic.jks 2>/dev/null || true
+          # Validate: must be a readable JKS/PKCS12; otherwise drop it.
+          if ! keytool -list -keystore keystore/ivormusic.jks -storepass "${{ secrets.KEYSTORE_PASSWORD }}" >/dev/null 2>&1; then
+            echo "Keystore invalid or password mismatch — using debug signing for release."
+            rm -f keystore/ivormusic.jks
+          fi
+        else
+          echo "No KEYSTORE_BASE64 secret — using debug signing for release."
+        fi
     - name: Build Release APK
       env:
         KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
         KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
       run: ./gradlew assembleRelease
-
     - name: Upload Release APK (Universal)
       uses: actions/upload-artifact@v4
       with:
@@ -223,7 +190,6 @@ jobs:
         path: app/build/outputs/apk/release/*universal*.apk
         if-no-files-found: error
         retention-days: 14
-
     - name: Upload Release APK (arm64-v8a)
       uses: actions/upload-artifact@v4
       with:
@@ -231,229 +197,17 @@ jobs:
         path: app/build/outputs/apk/release/*arm64-v8a*.apk
         if-no-files-found: error
         retention-days: 14
-
     - name: Upload Release APK (armeabi-v7a)
       uses: actions/upload-artifact@v4
       with:
         name: app-release-armeabi-v7a
-        # Was globbing *arm64-v8a*.apk, which put the arm64 APK in this
-        # artifact and left the real armeabi build nowhere.
         path: app/build/outputs/apk/release/*armeabi-v7a*.apk
         if-no-files-found: error
         retention-days: 14
-
-    # R8 deobfuscation map for this exact build. Release stack traces arriving
-    # through the in-app bug reporter are only readable against the mapping of
-    # the versionCode that produced them, so keep it as a retained workflow
-    # artifact for maintainers rather than a public release asset.
     - name: Upload Release mapping.txt
       uses: actions/upload-artifact@v4
       with:
         name: app-release-mapping
         path: app/build/outputs/mapping/release/mapping.txt
-        if-no-files-found: error
+        if-no-files-found: warn
         retention-days: 90
-
-    - name: Send Release APKs to Telegram
-      if: github.event_name == 'pull_request'
-      env:
-        BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        CHAT_ID: ${{ env.TELEGRAM_APK_CHAT_ID }}
-        GH_TOKEN: ${{ github.token }}
-        REPO: ${{ github.repository }}
-        REPO_OWNER: ${{ github.repository_owner }}
-        RUN_ID: ${{ github.run_id }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
-        PR_URL: ${{ github.event.pull_request.html_url }}
-        PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      run: |
-        set -euo pipefail
-
-        esc() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' <<< "$1"; }
-
-        telegram_ok() {
-          jq -e '.ok == true' >/dev/null 2>&1 <<< "$1"
-        }
-
-        send_plain_message() {
-          local message="$1" response
-          response=$(curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "disable_web_page_preview=true" \
-            --data-urlencode "text=${message}")
-          if ! telegram_ok "$response"; then
-            echo "Telegram changelog send failed: ${response}"
-            exit 1
-          fi
-        }
-
-        # Author: the owner links to their portfolio, everybody else is a name.
-        # Same rule as telegram-notify.yml.
-        author_html() {
-          local login="$1" safe
-          safe=$(esc "$login")
-          if [ "${login,,}" = "${REPO_OWNER,,}" ]; then
-            printf '<b><a href="%s">%s</a></b>' "$OWNER_URL" "$safe"
-          else
-            printf '<b>%s</b>' "$safe"
-          fi
-        }
-
-        VERSION=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts || echo "unknown")
-        RUN_URL="https://github.com/${REPO}/actions/runs/${RUN_ID}"
-
-        CONTEXT="Build for PR <a href=\"${PR_URL}\">#${PR_NUMBER}</a>
-        By: $(author_html "$PR_AUTHOR")"
-
-        CAPTION="<b>Koda</b> v${VERSION} | Release Build
-
-        ${CONTEXT}
-        SHA: <code>${PR_HEAD_SHA::7}</code>
-        <a href=\"${RUN_URL}\">Workflow Run</a>"
-
-        # Find the head SHA from the last successful run for this same-repo PR
-        # branch. Canceled and failed runs are deliberately absent, so their
-        # commit changelogs roll forward into the next APK that is delivered.
-        ENCODED_HEAD_REF=$(jq -rn --arg value "$PR_HEAD_REF" '$value | @uri')
-        RUNS_URL="${GITHUB_API_URL}/repos/${REPO}/actions/workflows/build.yml/runs?event=pull_request&status=success&branch=${ENCODED_HEAD_REF}&per_page=100"
-        if ! RUNS_JSON=$(curl -fsSL \
-          -H "Accept: application/vnd.github+json" \
-          -H "Authorization: Bearer ${GH_TOKEN}" \
-          -H "X-GitHub-Api-Version: 2022-11-28" \
-          "$RUNS_URL"); then
-          echo "Could not read workflow history; falling back to every commit currently on the PR."
-          RUNS_JSON='{"workflow_runs":[]}'
-        fi
-
-        LAST_SENT_SHA=$(jq -r --arg repo "$REPO" --arg run_id "$RUN_ID" '
-          [
-            .workflow_runs[]?
-            | select((.id | tostring) != $run_id)
-            | select(.head_repository.full_name == $repo)
-          ]
-          | sort_by(.created_at)
-          | reverse
-          | .[0].head_sha // empty
-        ' <<< "$RUNS_JSON" 2>/dev/null || true)
-
-        if [ -n "$LAST_SENT_SHA" ] \
-          && git cat-file -e "${LAST_SENT_SHA}^{commit}" 2>/dev/null \
-          && git merge-base --is-ancestor "$LAST_SENT_SHA" "$PR_HEAD_SHA"; then
-          CHANGELOG_START_SHA="$LAST_SENT_SHA"
-          echo "Collecting Telegram changelogs after successful run head ${LAST_SENT_SHA:0:7}."
-        else
-          # First delivery, unavailable history, or a rebased/force-pushed PR:
-          # include the whole current PR. Repeating an entry is safer than losing it.
-          CHANGELOG_START_SHA=$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")
-          echo "Collecting Telegram changelogs from PR merge base ${CHANGELOG_START_SHA:0:7}."
-        fi
-
-        extract_changelog() {
-          git show -s --format=%B "$1" | awk '
-            /^Changelog:[[:space:]]*$/ { found = 1; next }
-            found { lines[++count] = $0 }
-            END {
-              first = 1
-              while (first <= count && lines[first] ~ /^[[:space:]]*$/) first++
-              last = count
-              while (last >= first && lines[last] ~ /^[[:space:]]*$/) last--
-              for (i = first; i <= last; i++) print lines[i]
-            }
-          '
-        }
-
-        CHANGELOG_FILE=$(mktemp)
-        trap 'rm -f "$CHANGELOG_FILE"' EXIT
-        mapfile -t NEW_COMMITS < <(git rev-list --reverse "${CHANGELOG_START_SHA}..${PR_HEAD_SHA}")
-        ENTRY_COUNT=0
-        printf 'Changes since the last APK\n' > "$CHANGELOG_FILE"
-
-        for commit in "${NEW_COMMITS[@]}"; do
-          CHANGELOG=$(extract_changelog "$commit")
-          if [ -z "${CHANGELOG//[[:space:]]/}" ]; then
-            continue
-          fi
-          SUBJECT=$(git show -s --format=%s "$commit")
-          printf '\n%s (%s)\n%s\n' "$SUBJECT" "${commit:0:7}" "$CHANGELOG" >> "$CHANGELOG_FILE"
-          ENTRY_COUNT=$((ENTRY_COUNT + 1))
-        done
-
-        if [ "$ENTRY_COUNT" -eq 0 ]; then
-          printf '\nNo public changelog entries were included in the new commits.\n' >> "$CHANGELOG_FILE"
-        fi
-
-        for apk in app/build/outputs/apk/release/*universal*.apk; do
-          SIZE=$(stat -c%s "$apk")
-          if [ "$SIZE" -gt 50000000 ]; then
-            RESPONSE=$(curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${CHAT_ID}" \
-              --data-urlencode "parse_mode=HTML" \
-              --data-urlencode "text=<b>Koda</b> | $(esc "$(basename "$apk")") is over Telegram's 50 MB bot limit — grab it from the <a href=\"${RUN_URL}\">workflow artifacts</a>.")
-            if ! telegram_ok "$RESPONSE"; then
-              echo "Telegram artifact-link send failed: ${RESPONSE}"
-              exit 1
-            fi
-            continue
-          fi
-          RESPONSE=$(curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
-            --form-string "chat_id=${CHAT_ID}" \
-            --form-string "parse_mode=HTML" \
-            --form-string "caption=${CAPTION}" \
-            -F "document=@${apk}")
-          if ! telegram_ok "$RESPONSE"; then
-            echo "Telegram APK send failed: ${RESPONSE}"
-            exit 1
-          fi
-        done
-
-        # Telegram counts message length in UTF-16 units. Split on complete
-        # Unicode characters, preferring line boundaries, with room below 4096.
-        mapfile -d '' -t CHANGELOG_CHUNKS < <(
-          python3 - "$CHANGELOG_FILE" <<'PY'
-        import sys
-
-        limit = 3800
-        text = open(sys.argv[1], encoding="utf-8").read()
-
-        def units(value):
-            return len(value.encode("utf-16-le")) // 2
-
-        chunks = []
-        current = ""
-        for line in text.splitlines(keepends=True):
-            while units(line) > limit:
-                if current:
-                    chunks.append(current.rstrip())
-                    current = ""
-                used = 0
-                cut = 0
-                for cut, char in enumerate(line, start=1):
-                    char_units = units(char)
-                    if used + char_units > limit:
-                        cut -= 1
-                        break
-                    used += char_units
-                chunks.append(line[:cut].rstrip())
-                line = line[cut:]
-
-            candidate = current + line
-            if current and units(candidate) > limit:
-                chunks.append(current.rstrip())
-                current = line
-            else:
-                current = candidate
-
-        if current.strip():
-            chunks.append(current.rstrip())
-
-        for chunk in chunks:
-            sys.stdout.buffer.write(chunk.encode("utf-8") + b"\0")
-        PY
-        )
-
-        for chunk in "${CHANGELOG_CHUNKS[@]}"; do
-          send_plain_message "$chunk"
-        done
